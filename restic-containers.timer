@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily restic backup of ~/Containers
+
+[Timer]
+OnCalendar=*-*-* 04:30
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

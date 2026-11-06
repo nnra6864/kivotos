@@ -1,0 +1,6 @@
+# Paths restic-containers skips. One pattern per line, see `restic help backup` (--exclude-file).
+# Rebuildable: forgejo CI's docker-in-docker images and omnisearch's cache
+/home/nn/Containers/forgejo/data/dind
+/home/nn/Containers/omnisearch/cache
+# Backed up as a pg_dumpall instead (a live copy of the data dir isn't safe to restore)
+/home/nn/Containers/Postgres/data/db
