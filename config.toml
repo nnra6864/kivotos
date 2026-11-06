@@ -1,7 +1,7 @@
-# kivotos host settings. Installed to /etc/kivotos/config.toml (only if it doesn't exist yet).
+# kivotos host settings. install.sh copies this to /etc/kivotos/config.toml on the first run (never overwrites it).
 # After changing `schedule`, `randomized_delay`, `repository` or a source `path`, run:  sudo kivotos units
 
-repository    = "/tank/backups/containers/restic"
+repository    = "/tank/backups/kivotos"   # a local path, or any restic repo URL (sftp:, s3:, rest:, ...)
 password_file = "/etc/kivotos/password"
 cache_dir     = "/var/cache/kivotos"
 
@@ -9,8 +9,8 @@ cache_dir     = "/var/cache/kivotos"
 schedule         = "*-*-* 04:30"
 randomized_delay = "15m"
 
-# Hooks, dumps and podman commands run as this user, never as root
-user = "nn"
+# Hooks, dumps and podman commands run as this user, never as root. install.sh fills in whoever ran sudo.
+user = "your-user"
 
 # Kept per service (per backed-up path); everything older is pruned
 [retention]

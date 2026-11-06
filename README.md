@@ -18,16 +18,18 @@ One Python file, standard library only. It needs restic ≥ 0.17 and Python ≥ 
 sudo sh ~/Packages/kivotos/install.sh
 ```
 
-You can run it again at any time. It installs `/usr/local/bin/kivotos` and writes the systemd service and timer from the config.
-It creates `/etc/kivotos/config.toml` only if it's missing, so your edits there are kept.
-**Re-run it after changing the program in this folder.** It also cleans up the older `restic-containers` setup (units, `/etc/restic`) and moves its password over.
+The first run installs `/usr/local/bin/kivotos` and writes `/etc/kivotos/config.toml`, with `user` set to whoever ran sudo. Then it stops.
+Check the repository and the sources (`sudoedit /etc/kivotos/config.toml`), then run it again.
+The second run creates the password and the repo, and writes the systemd service and timer from the config.
+
+You can run it again at any time, and you should **after changing the program in this folder**. It never overwrites the config, the password or a repo it can open.
 
 | What | Where | Owner |
 |---|---|---|
 | Program | `/usr/local/bin/kivotos` | root |
 | Host settings (repo, schedule, retention, sources) | `/etc/kivotos/config.toml` | root |
 | Repo password | `/etc/kivotos/password` (**keep a copy in your password manager**) | root, 600 |
-| Repo | `/tank/backups/containers/restic` (also snapshotted daily by sanoid) | root |
+| Repo | `repository` in the config, e.g. `/tank/backups/kivotos` (a ZFS dataset there can also be snapshotted by sanoid) | root |
 | Per-service rules | `~/Containers/<svc>/kivotos.toml` | you |
 
 ## Usage
@@ -63,8 +65,12 @@ For each service, in this order:
 Then comes **retention** (per backed-up path: 7 daily, 4 weekly, 6 monthly by default), then `restic check`.
 
 kivotos doesn't stop at the first problem: it carries on and backs up everything else.
-Afterwards it lists every problem and exits with 1.
+Afterwards it lists every problem and exits with 1, so `kivotos.service` fails.
 Examples of problems: a failed hook or dump, a broken `kivotos.toml`, or an unreadable file.
+
+To be alerted, hang an `OnFailure=` on the service with `sudo systemctl edit kivotos.service`.
+That drop-in survives `kivotos units`, which only rewrites the unit files themselves.
+[sema](../../../sema) does this for every system service and sends the alert to Matrix, so with its `onfailure` module on, there's nothing to set up here.
 A container that isn't running is not an error. Its dumps and `if_running` hooks are just skipped.
 
 ## Per-service rules: `kivotos.toml`

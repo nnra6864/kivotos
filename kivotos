@@ -18,6 +18,7 @@ import os
 import pwd
 import re
 import shlex
+import signal
 import stat
 import subprocess
 import sys
@@ -85,6 +86,10 @@ def load_config() -> dict:
             die(f"{CONFIG}: missing '{key}'")
     if not cfg.get("source"):
         die(f"{CONFIG}: no [[source]] entries")
+    try:
+        pwd.getpwnam(cfg["user"])
+    except KeyError:
+        die(f"{CONFIG}: user {cfg['user']!r} doesn't exist on this machine")
     return cfg
 
 
@@ -403,6 +408,7 @@ def cmd_units(cfg: dict) -> None:
 
 
 def main() -> None:
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # quiet exit when piped into head/less
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
