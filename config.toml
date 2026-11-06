@@ -1,0 +1,26 @@
+# kivotos host settings. Installed to /etc/kivotos/config.toml (only if it doesn't exist yet).
+# After changing `schedule` or `randomized_delay`, run:  sudo kivotos timer
+
+repository    = "/tank/backups/containers/restic"
+password_file = "/etc/kivotos/password"
+cache_dir     = "/var/cache/kivotos"
+
+# systemd OnCalendar syntax (check one with: systemd-analyze calendar '...'). A missed run happens after boot.
+schedule         = "*-*-* 04:30"
+randomized_delay = "15m"
+
+# Hooks, dumps and podman commands run as this user, never as root
+user = "nn"
+
+# Kept per service (per backed-up path); everything older is pruned
+[retention]
+daily   = 7
+weekly  = 4
+monthly = 6
+
+# Every directory directly inside `path` is a service and gets its own snapshot.
+# A service's own rules go in <path>/<service>/kivotos.toml (see README).
+[[source]]
+name    = "containers"
+path    = "/home/nn/Containers"
+exclude = []   # applied inside every service of this source, same syntax as the per-service exclude

@@ -1,0 +1,9 @@
+[Unit]
+Description=kivotos backups
+RequiresMountsFor=/home /tank/backups
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/kivotos run
+Nice=10
+IOSchedulingClass=idle

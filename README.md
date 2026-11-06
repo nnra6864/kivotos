@@ -1,130 +1,192 @@
-# restic-containers
+# kivotos
 
-Daily [restic](https://restic.net) backup of `~/Containers`, which sits on the SSD (ext4) and so gets no ZFS snapshots.
-Everything on `/tank` is covered by sanoid snapshots instead (see `/etc/sanoid/sanoid.conf`).
+*Κιβωτός*, the ark: keeps things safe through the flood.
+
+Restic backups of service directories. Each service's backup rules live next to it in a `kivotos.toml`,
+so a service directory carries its own backup rules wherever you move it.
+Right now it backs up `~/Containers`, which sits on the SSD (ext4) and so gets no ZFS snapshots.
+Everything on `/tank` is covered by sanoid instead (`/etc/sanoid/sanoid.conf`).
+
+One Python file, standard library only. It needs restic ≥ 0.17 and Python ≥ 3.11.
 
 ## Install / update
 
 ```sh
-sudo sh ~/Packages/restic-containers/install.sh
+sudo sh ~/Packages/kivotos/install.sh
 ```
 
-You can run it again at any time. It copies the script, the excludes and the units into place, and enables the timer.
-It never overwrites the password or a repo that the password can open.
-**Run it again after every change in this folder.** The live copies are the ones in `/usr/local/bin` and `/etc`, not the files here.
+You can run it again at any time. It installs `/usr/local/bin/kivotos` and `kivotos.service`, and writes the timer from the config.
+It creates `/etc/kivotos/config.toml` only if it's missing, so your edits there are kept.
+**Re-run it after changing the program in this folder.** It also cleans up the older `restic-containers` setup (units, `/etc/restic`) and moves its password over.
 
-| File | Installed to |
-|---|---|
-| `restic-containers` | `/usr/local/bin/restic-containers` |
-| `containers.env` | `/etc/restic/containers.env` (repo path, password file, cache dir) |
-| `containers.exclude` | `/etc/restic/containers.exclude` |
-| `restic-containers.{service,timer}` | `/etc/systemd/system/` |
-| generated on first install | `/etc/restic/containers.password`. **Keep a copy in your password manager.** Without it the backups can't be opened. |
+| What | Where | Owner |
+|---|---|---|
+| Program | `/usr/local/bin/kivotos` | root |
+| Host settings (repo, schedule, retention, sources) | `/etc/kivotos/config.toml` | root |
+| Repo password | `/etc/kivotos/password` (**keep a copy in your password manager**) | root, 600 |
+| Repo | `/tank/backups/containers/restic` (also snapshotted daily by sanoid) | root |
+| Per-service rules | `~/Containers/<svc>/kivotos.toml` | you |
 
-The repo lives at `/tank/backups/containers/restic`, and sanoid snapshots it daily as part of `tank/backups`.
+## Usage
+
+```sh
+kivotos plan                         # what a run would do, per service (no sudo needed)
+sudo systemctl start kivotos         # back up now, the same as the timer (logs: journalctl -u kivotos)
+sudo kivotos run NetBird Postgres    # back up only these services (no retention or check)
+sudo kivotos run --dry-run           # what restic would back up; no hooks, dumps or stopping
+systemctl list-timers kivotos        # next and last run
+sudo kivotos restic <anything>       # any restic command against the repo, for example:
+sudo kivotos restic snapshots --tag NetBird
+sudo kivotos restic ls latest --path /home/nn/Containers/NetBird
+sudo kivotos restic stats --mode raw-data
+```
+
+Change the schedule in `/etc/kivotos/config.toml` (`sudoedit` it), then run `sudo kivotos timer` to rewrite the timer.
 
 ## What a run does
 
-The timer fires daily at about 04:30 (`Persistent=true`, so a run that was missed while the machine was off happens after the next boot).
+Every **directory directly inside a source** (`~/Containers/*`) is a service, and each one gets its **own snapshot**.
+Snapshots are tagged with the source and the service name, for example `containers,NetBird`.
+Loose files at the top (`AGENTS.md`, `TODO.md`, ...) go in one extra snapshot tagged `_files`.
+Symlinked directories are ignored.
 
-1. **Minecraft (`nn-survival`)**: `rcon-cli save-off` and `save-all flush`, so the world on disk is consistent. Saving is turned back on right after the copy, even if the backup fails.
-2. **`~/Containers`**: backed up, minus `containers.exclude`. Tag `containers`.
-3. **Postgres (`postgres-db`)**: `pg_dumpall` is streamed into the repo as `postgres-all.sql`. Tag `postgres`.
-   The live data dir is excluded, because a copy taken while the database is running may not restore.
-4. **Retention**: keeps 7 daily, 4 weekly and 6 monthly per tag, prunes the rest, then runs `restic check`.
+For each service, in this order:
 
-Stopped containers are skipped without an error. If any step fails, the service fails and sema's global `OnFailure=` hook sends a Matrix alert.
+1. **Dumps** run while everything is still up. Each one is streamed straight into the repo, with no temp files, as `<svc>/<file>`, tagged `dump`.
+2. **`before` hook**, then **stop** the listed containers.
+3. **Back up the directory**, minus its excludes.
+4. **Start** the stopped containers again, then the **`after` hook**. These always run, even if the backup failed.
 
-## Everyday commands
+Then comes **retention** (per backed-up path: 7 daily, 4 weekly, 6 monthly by default), then `restic check`.
 
-`sudo restic-containers` with no arguments takes a backup. With arguments, it runs restic against the repo with the right password and paths:
+kivotos doesn't stop at the first problem: it carries on and backs up everything else.
+Afterwards it lists every problem and exits with 1, so the service fails and sema's `OnFailure=` hook sends a Matrix alert.
+Examples of problems: a failed hook or dump, a broken `kivotos.toml`, or an unreadable file.
+A container that isn't running is not an error. Its dumps and `if_running` hooks are just skipped.
 
-```sh
-sudo systemctl start restic-containers         # back up now, the same as the timer (logs: journalctl -u restic-containers)
-systemctl list-timers restic-containers        # next and last run
-sudo restic-containers snapshots               # list backups
-sudo restic-containers ls latest --tag containers /home/nn/Containers/NetBird
-sudo restic-containers diff <id1> <id2>        # what changed between two backups
-sudo restic-containers stats --mode raw-data   # actual space used by the repo
+## Per-service rules: `kivotos.toml`
+
+**No file means the whole directory is backed up as is.** So a new service needs nothing, as long as its data is in bind mounts under its directory.
+Add a `kivotos.toml` only for special cases. Every key is optional:
+
+```toml
+# Like .gitignore: "name" matches at any depth, "a/b" or "/name" is relative to this dir.
+# No '!' negation and no '..'. Patterns can't reach outside the service dir.
+exclude = ["cache", "data/dind"]
+
+skip = false                  # true: don't back up this service at all
+
+stop = ["foo", "foo-worker"]  # stopped for this service's backup (only if running), started again after
+
+[hooks]                       # shell commands, run as `nn` in this service's dir
+if_running = "foo"            # only run the hooks while this container is up
+before = "podman exec foo some-flush-command"
+after  = "podman exec foo some-resume-command"
+
+[[dump]]                      # as many as you like
+name      = "foo-db"          # letters, digits, . _ -
+container = "foo-db"          # run with `podman exec` in this container; leave it out to run on the host as nn
+command   = "pg_dumpall -U postgres"   # stdout is what gets stored
+file      = "foo.sql"         # stored as <svc>/foo.sql (default: <name>.dump)
 ```
 
-## Restoring
+The ones in use now:
 
-Stop the container first: `cd ~/Containers/<svc> && podman compose down`.
+| Service | Rules |
+|---|---|
+| `Postgres` | excludes `data/db`, dumps `pg_dumpall` from `postgres-db` |
+| `minecraft-NnSurvival` | `save-off` + `save-all flush` before, `save-on` after (only while `nn-survival` runs) |
+| `forgejo` | excludes `data/dind` (CI image cache) |
+| `omnisearch` | excludes `/cache` |
 
-```sh
-# One service, restored in place (files come back with their original subuid owners)
-sudo restic-containers restore latest --tag containers --target / --include /home/nn/Containers/NetBird
+### Security
 
-# Or restore somewhere else to look around first
-sudo restic-containers restore latest --tag containers --target /tmp/restore --include /home/nn/Containers/NetBird
+kivotos runs as **root**, for two reasons. It has to read files owned by container subuids, and the repo must be out of reach of your user, so ransomware running as `nn` can't touch it.
+`kivotos.toml` files belong to your user, so root treats them strictly as **data**:
 
-# Browse a backup as a filesystem (Ctrl-C to unmount)
-sudo mkdir -p /mnt/restic && sudo restic-containers mount /mnt/restic
-```
+- Hooks, dump commands and every `podman` call run as `user` from the config (`nn`), through `runuser` with a clean environment. **Nothing from a `kivotos.toml` is ever executed as root.** Root only stores the output.
+- Excludes are anchored inside the service directory. `..` and `!` are rejected.
+- Symlinked service dirs and a symlinked `kivotos.toml` are refused. Root never follows them out of the tree.
+- The worst a tampered `kivotos.toml` can do is skip or exclude its own service's data. A `*` exclude is reported as a problem. `kivotos plan` shows everything that's set.
 
-Postgres, from the dump (the DB user is `nn`). Use this on an empty or fresh cluster. On an existing one, roles and databases that are already there will error out:
+Keep hook scripts next to `compose.yaml`, **never inside a directory that's mounted into a container**.
+Otherwise a compromised container could rewrite what runs as your user.
 
-```sh
-sudo restic-containers dump latest postgres-all.sql --tag postgres > ~/postgres-all.sql
-podman exec -i postgres-db psql -U nn -d postgres < ~/postgres-all.sql
-```
+## Databases in services
 
-## Adding new containers
-
-**Nothing to do in most cases.** The whole `~/Containers` dir is backed up, so a new `~/Containers/foo/` with bind mounts under it is included automatically.
-
-You only need to touch this setup when the new service:
-
-- **Keeps data outside `~/Containers`.** If it's under `/tank/services/...`, sanoid covers it, and new child datasets inherit the `services` template (`recursive = yes`).
-  Anything else (named podman volumes in `~/.local/share/containers`, `/srv/...`) is **not** backed up. Prefer bind mounts into `~/Containers/foo/` or `/tank/services/foo`.
-- **Has big rebuildable junk** (caches, downloaded images, build dirs). Add the path to `containers.exclude` and re-run `install.sh`.
-- **Has a database** (see below).
-
-## Containers with their own database
-
-Copying a database's files while it's writing to them can give a backup that won't open. How much that matters depends on the database:
+Copying a database's files while it's writing to them can give a backup that won't open:
 
 | Kind | Examples here | What to do |
 |---|---|---|
-| Postgres / MySQL / MariaDB | `postgres-db` | Dump it (already done for `postgres-db`). Add a dump step for any new DB server. |
-| SQLite | grafana, NetBird, n8n, minecraft's `banhammer-sqlite.db` | Fine for small apps that rarely write: SQLite usually recovers from a live copy. For anything important, add a `.backup` step. |
-| RocksDB / LevelDB / embedded KV | tuwunel (on `/tank`, so covered by sanoid) | Stop the container briefly, or rely on ZFS snapshots, which are atomic. |
-| Redis / Valkey | `searxng-valkey` (cache only) | Usually not worth it. Otherwise `redis-cli SAVE` before the backup. |
+| Postgres / MySQL / MariaDB | `postgres-db` | Add a `[[dump]]`, and exclude the raw data dir |
+| SQLite | grafana, NetBird, n8n | Fine for small apps that rarely write. For important ones, use the SQLite `[[dump]]` recipe below if the image has sqlite3, or use `stop` |
+| RocksDB / LevelDB / embedded KV | tuwunel (on `/tank`) | `stop` the container, or keep the data on `/tank`: ZFS snapshots are atomic, like a power cut, which databases are built to survive |
+| Redis / Valkey | `searxng-valkey` (cache) | Usually not worth it. Otherwise use a `before` hook with `redis-cli SAVE` |
 
-A **ZFS snapshot is atomic**, so it's as good as pulling the power cord: databases are built to recover from that.
-That's why a database that's important and busy is best kept on `/tank/services/<svc>`.
+Recipes:
 
-To add a dump step, copy the Postgres block in `restic-containers` and change the command. Each one becomes its own snapshot with its own tag, and gets retention automatically:
+```toml
+[[dump]]   # MariaDB / MySQL
+name      = "mariadb"
+container = "foo-db"
+command   = 'mariadb-dump --all-databases -uroot -p"$MARIADB_ROOT_PASSWORD"'
+file      = "mariadb.sql"
 
-```bash
-# MariaDB / MySQL
-if running foo-db; then
-    restic backup --tag foo-db --stdin-filename foo.sql --stdin-from-command -- \
-        runuser -u nn -- env XDG_RUNTIME_DIR=/run/user/1000 \
-        podman exec foo-db sh -c 'mariadb-dump --all-databases -uroot -p"$MARIADB_ROOT_PASSWORD"'
-fi
-
-# SQLite (needs sqlite3 inside the container; if it isn't there, stop the container around the backup instead)
-if running foo; then
-    restic backup --tag foo-db --stdin-filename foo.db --stdin-from-command -- \
-        runuser -u nn -- env XDG_RUNTIME_DIR=/run/user/1000 \
-        podman exec foo sh -c 'sqlite3 /data/foo.db ".backup /tmp/b.db" && cat /tmp/b.db && rm /tmp/b.db'
-fi
+[[dump]]   # SQLite, if the image has sqlite3
+name      = "app-db"
+container = "foo"
+command   = "sqlite3 /data/app.db '.backup /tmp/kivotos.db' && cat /tmp/kivotos.db && rm /tmp/kivotos.db"
+file      = "app.db"
 ```
 
-If you dump a database, also exclude its raw files in `containers.exclude`, so you don't store them twice. Then re-run `install.sh`.
+Rule of thumb: a busy, important database goes on `/tank/services/<svc>`. A small app database can stay in `~/Containers`. A database server gets a `[[dump]]`.
+
+## Restoring
+
+Stop the service first: `cd ~/Containers/<svc> && podman compose down`.
+
+```sh
+# One service, in place. Files come back with their original subuid owners.
+sudo kivotos restic restore latest --path /home/nn/Containers/NetBird --target /
+
+# Somewhere else first, to look around
+sudo kivotos restic restore latest --path /home/nn/Containers/NetBird --target /tmp/restore
+
+# A single file or folder from an older snapshot
+sudo kivotos restic snapshots --tag NetBird
+sudo kivotos restic restore <id> --target /tmp/restore --include /home/nn/Containers/NetBird/config.yaml
+
+# Browse everything as a filesystem (Ctrl-C to unmount)
+sudo mkdir -p /mnt/kivotos && sudo kivotos restic mount /mnt/kivotos
+```
+
+Postgres from the dump (the DB user is `nn`). Use it on an empty or fresh cluster, because roles and databases that already exist will error:
+
+```sh
+sudo kivotos restic dump latest Postgres/postgres-all.sql --path /Postgres/postgres-all.sql > ~/postgres-all.sql
+podman exec -i postgres-db psql -U nn -d postgres < ~/postgres-all.sql
+```
+
+## Adding a source
+
+To back up another tree of services, add a `[[source]]` block to `/etc/kivotos/config.toml`. Nothing else is needed:
+
+```toml
+[[source]]
+name = "projects"
+path = "/home/nn/Projects"
+exclude = ["node_modules", "target", ".venv"]   # applied inside every service of this source
+```
 
 ## Off-site copy (later)
 
 The repo is on the same single HDD as `/tank`, so it covers losing the SSD but not losing the HDD.
-To add a second copy, create a repo elsewhere (USB disk, B2, Hetzner Storage Box, another box over NetBird).
-Then copy snapshots into it, for example as a step at the end of `restic-containers`:
+For a second copy, make a repo elsewhere (USB disk, B2, Hetzner Storage Box, another box over NetBird) and copy snapshots into it:
 
 ```sh
-restic -r <new-repo> --password-file <new-password-file> init
-restic -r <new-repo> --password-file <new-password-file> copy \
-    --from-repo /tank/backups/containers/restic --from-password-file /etc/restic/containers.password
+restic -r <new-repo> --password-file <new-pw> init
+restic -r <new-repo> --password-file <new-pw> copy \
+    --from-repo /tank/backups/containers/restic --from-password-file /etc/kivotos/password
 ```
 
 The repo is encrypted, so an untrusted host is fine.

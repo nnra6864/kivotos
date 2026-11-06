@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""kivotos: restic backups of service directories, with the rules for each service kept next to it.
+
+  sudo kivotos run [SVC ...] [--dry-run]   back up every service (or only the ones named)
+  kivotos plan                             show what a run would do (no root needed)
+  sudo kivotos timer                       (re)write the systemd timer from the config
+  sudo kivotos restic ARGS ...             any restic command against the repo
+
+Host settings:  /etc/kivotos/config.toml   (root-owned)
+Service rules:  <source>/<svc>/kivotos.toml (optional, owned by the service user)
+
+Security model: kivotos runs as root so it can read files owned by container subuids and write
+a repo the service user can't touch. Service rules are only parsed as data. Every hook, dump
+and podman call runs as the unprivileged `user` from the config, never as root.
+"""
+
+import os
+import pwd
+import re
+import shlex
+import stat
+import subprocess
+import sys
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+CONFIG = Path(os.environ.get("KIVOTOS_CONFIG", "/etc/kivotos/config.toml"))
+RULES = "kivotos.toml"
+TIMER = Path("/etc/systemd/system/kivotos.timer")
+HOOK_TIMEOUT = 15 * 60
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+errors: list[str] = []
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def error(msg: str) -> None:
+    errors.append(msg)
+    print(f"!! {msg}", file=sys.stderr, flush=True)
+
+
+def die(msg: str) -> None:
+    print(f"kivotos: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+# --- config -----------------------------------------------------------------------------------
+
+@dataclass
+class Dump:
+    name: str
+    command: str
+    container: str | None
+    file: str
+
+
+@dataclass
+class Service:
+    name: str
+    path: Path
+    exclude: list[str] = field(default_factory=list)
+    skip: bool = False
+    stop: list[str] = field(default_factory=list)
+    before: str | None = None
+    after: str | None = None
+    if_running: str | None = None
+    dumps: list[Dump] = field(default_factory=list)
+    has_rules: bool = False
+
+
+def load_config() -> dict:
+    try:
+        with CONFIG.open("rb") as f:
+            cfg = tomllib.load(f)
+    except FileNotFoundError:
+        die(f"{CONFIG} not found, run install.sh")
+    except tomllib.TOMLDecodeError as e:
+        die(f"{CONFIG}: {e}")
+    for key in ("repository", "password_file", "user"):
+        if key not in cfg:
+            die(f"{CONFIG}: missing '{key}'")
+    if not cfg.get("source"):
+        die(f"{CONFIG}: no [[source]] entries")
+    return cfg
+
+
+def read_rules(path: Path) -> dict | None:
+    """Parse a service's kivotos.toml as data. Refuses symlinks and anything but a regular file."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise ValueError(f"can't open safely ({e.strerror})")
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise ValueError("not a regular file")
+        try:
+            return tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            raise ValueError(str(e))
+
+
+def anchor(base: Path, pattern: str) -> list[str]:
+    """gitignore-ish pattern -> restic exclude patterns that can't reach outside `base`.
+    'a/b' (contains a slash) is relative to base, 'name' matches at any depth under base."""
+    p = pattern.strip()
+    if not p or p.startswith("!") or ".." in Path(p).parts:
+        raise ValueError(f"bad exclude pattern {pattern!r} (no '!', no '..')")
+    if "/" in p.rstrip("/"):
+        return [f"{base}/{p.strip('/')}"]
+    p = p.rstrip("/")
+    return [f"{base}/{p}", f"{base}/**/{p}"]
+
+
+def str_list(value, what: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ValueError(f"'{what}' must be a string or a list of strings")
+    return value
+
+
+def parse_service(path: Path, rules: dict) -> Service:
+    svc = Service(name=path.name, path=path, has_rules=True)
+    known = {"exclude", "skip", "stop", "hooks", "dump"}
+    if unknown := set(rules) - known:
+        raise ValueError(f"unknown keys {sorted(unknown)}")
+    svc.exclude = str_list(rules.get("exclude"), "exclude")
+    svc.skip = bool(rules.get("skip", False))
+    svc.stop = str_list(rules.get("stop"), "stop")
+    hooks = rules.get("hooks", {})
+    if not isinstance(hooks, dict) or set(hooks) - {"before", "after", "if_running"}:
+        raise ValueError("[hooks] takes only 'before', 'after' and 'if_running'")
+    svc.before, svc.after, svc.if_running = hooks.get("before"), hooks.get("after"), hooks.get("if_running")
+    for h in (svc.before, svc.after):
+        if h is not None and not isinstance(h, str):
+            raise ValueError("hooks must be strings")
+    for d in rules.get("dump", []):
+        name = d.get("name", "")
+        if not NAME_RE.match(name):
+            raise ValueError(f"dump name {name!r} must match {NAME_RE.pattern}")
+        file = d.get("file", f"{name}.dump")
+        if not NAME_RE.match(file):
+            raise ValueError(f"dump file {file!r} must be a plain file name")
+        if not isinstance(d.get("command"), str):
+            raise ValueError(f"dump '{name}' needs a 'command'")
+        svc.dumps.append(Dump(name, d["command"], d.get("container"), file))
+    for c in svc.stop + [d.container for d in svc.dumps if d.container] + ([svc.if_running] if svc.if_running else []):
+        if not NAME_RE.match(c):
+            raise ValueError(f"bad container name {c!r}")
+    return svc
+
+
+def discover(source: Path) -> tuple[list[Service], list[Path]]:
+    """Each real (non-symlink) directory under the source is a service. Returns services + loose files."""
+    services, loose = [], []
+    for entry in sorted(os.scandir(source), key=lambda e: e.name.lower()):
+        path = Path(entry.path)
+        if entry.is_dir(follow_symlinks=False):
+            try:
+                rules = read_rules(path / RULES)
+                services.append(parse_service(path, rules) if rules is not None else Service(path.name, path))
+            except ValueError as e:
+                error(f"{path / RULES}: {e}. Backing up {path.name} with no rules")
+                services.append(Service(path.name, path))
+        elif entry.is_file(follow_symlinks=False):
+            loose.append(path)
+    return services, loose
+
+
+# --- running things as the service user --------------------------------------------------------
+
+class User:
+    def __init__(self, name: str):
+        pw = pwd.getpwnam(name)
+        self.name, self.home = name, pw.pw_dir
+        self.env = {
+            "HOME": pw.pw_dir, "USER": name, "LOGNAME": name,
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "XDG_RUNTIME_DIR": f"/run/user/{pw.pw_uid}",
+        }
+
+    def argv(self, *cmd: str) -> list[str]:
+        env = [f"{k}={v}" for k, v in self.env.items()]
+        return ["runuser", "-u", self.name, "--", "env", "-i", *env, *cmd]
+
+    def run(self, *cmd: str, cwd: Path | str = "/", quiet: bool = False) -> bool:
+        try:
+            r = subprocess.run(self.argv(*cmd), cwd=cwd, timeout=HOOK_TIMEOUT,
+                               stdout=subprocess.DEVNULL if quiet else None)
+            return r.returncode == 0
+        except subprocess.TimeoutExpired:
+            error(f"timed out: {shlex.join(cmd)}")
+            return False
+
+    def running(self, container: str) -> bool:
+        r = subprocess.run(self.argv("podman", "inspect", "-f", "{{.State.Running}}", container),
+                           cwd="/", capture_output=True, text=True)
+        return r.stdout.strip() == "true"
+
+
+# --- restic -------------------------------------------------------------------------------------
+
+def restic_env(cfg: dict) -> None:
+    os.environ["RESTIC_REPOSITORY"] = cfg["repository"]
+    os.environ["RESTIC_PASSWORD_FILE"] = cfg["password_file"]
+    os.environ["RESTIC_CACHE_DIR"] = cfg.get("cache_dir", "/var/cache/kivotos")
+
+
+def restic(*args: str) -> bool:
+    r = subprocess.run(["restic", *args], cwd="/")
+    if r.returncode == 3:
+        error(f"restic {args[0]}: some files couldn't be read (snapshot was still saved)")
+    elif r.returncode != 0:
+        error(f"restic {args[0]} failed (exit {r.returncode})")
+    return r.returncode == 0
+
+
+def backup_service(svc: Service, src: dict, user: User, dry: bool) -> None:
+    tags = ["--tag", f"{src['name']},{svc.name}"]
+    log(f"\n== {src['name']}/{svc.name}")
+    if svc.skip:
+        log("   skip = true, not backed up")
+        return
+
+    excludes = []
+    for p in src.get("exclude", []) + svc.exclude:
+        try:
+            excludes += anchor(svc.path, p)
+            log(f"   exclude {p}")
+        except ValueError as e:
+            error(f"{svc.name}: {e}")
+    if any(p.strip().strip("/") in ("*", "**") for p in svc.exclude):
+        error(f"{svc.name}: excludes everything ({svc.path / RULES})")
+
+    # 1. Dumps, while everything is still running
+    for d in svc.dumps:
+        if dry:
+            log(f"   dump {d.name} (skipped in dry run)")
+            continue
+        if d.container and not user.running(d.container):
+            log(f"   dump {d.name}: {d.container} isn't running, skipped")
+            continue
+        log(f"   dump {d.name} -> {svc.name}/{d.file}")
+        cmd = ["podman", "exec", d.container, "sh", "-c", d.command] if d.container else ["sh", "-c", d.command]
+        restic("backup", *tags, "--tag", "dump", "--stdin-filename", f"{svc.name}/{d.file}",
+               "--stdin-from-command", "--", *user.argv(*cmd))
+
+    # 2. Quiesce: before hook, then stop containers
+    stopped = []
+    hooks = bool(svc.before or svc.after) and not dry
+    if hooks and svc.if_running and not user.running(svc.if_running):
+        log(f"   {svc.if_running} isn't running, hooks skipped")
+        hooks = False
+    if not dry:
+        if svc.before and hooks:
+            log(f"   before: {svc.before}")
+            if not user.run("sh", "-c", svc.before, cwd=svc.path):
+                error(f"{svc.name}: before hook failed, backing up anyway")
+        for c in svc.stop:
+            if user.running(c):
+                log(f"   stopping {c}")
+                if user.run("podman", "stop", c, quiet=True):
+                    stopped.append(c)
+                else:
+                    error(f"{svc.name}: couldn't stop {c}, backing up while it runs")
+
+    # 3. Files. Whatever happens, start containers again and run the after hook.
+    try:
+        args = ["backup", *tags, "--one-file-system", "--exclude-caches"]
+        for e in excludes:
+            args += ["--exclude", e]
+        if dry:
+            args += ["--dry-run", "-q"]
+        restic(*args, str(svc.path))
+    finally:
+        for c in reversed(stopped):
+            log(f"   starting {c}")
+            if not user.run("podman", "start", c, quiet=True):
+                error(f"{svc.name}: couldn't start {c} again! Run: podman start {c}")
+        if svc.after and hooks:
+            log(f"   after: {svc.after}")
+            if not user.run("sh", "-c", svc.after, cwd=svc.path):
+                error(f"{svc.name}: after hook failed")
+
+
+def cmd_run(cfg: dict, only: list[str], dry: bool) -> None:
+    if os.geteuid() != 0:
+        die("run needs root: sudo kivotos run")
+    user = User(cfg["user"])
+    restic_env(cfg)
+    seen = set()
+    for src in cfg["source"]:
+        root = Path(src["path"])
+        if not root.is_dir():
+            error(f"source {src['name']}: {root} doesn't exist")
+            continue
+        services, loose = discover(root)
+        for svc in services:
+            if only and svc.name not in only:
+                continue
+            seen.add(svc.name)
+            backup_service(svc, src, user, dry)
+        if loose and not only:
+            log(f"\n== {src['name']} (loose files: {', '.join(p.name for p in loose)})")
+            restic("backup", "--tag", f"{src['name']},_files", *(["--dry-run", "-q"] if dry else []),
+                   *map(str, loose))
+    if missing := set(only) - seen:
+        error(f"no such service: {', '.join(sorted(missing))}")
+
+    if not dry and not only:
+        r = cfg.get("retention", {})
+        keep = []
+        for k in ("hourly", "daily", "weekly", "monthly", "yearly"):
+            if r.get(k):
+                keep += [f"--keep-{k}", str(r[k])]
+        if keep:
+            log("\n== retention")
+            restic("forget", "--group-by", "host,paths", *keep, "--prune")
+        log("\n== check")
+        restic("check")
+
+    if errors:
+        print(f"\nkivotos finished with {len(errors)} problem(s):", file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        sys.exit(1)
+    log("\nkivotos: all good")
+
+
+def cmd_plan(cfg: dict) -> None:
+    log(f"repo {cfg['repository']}, schedule {cfg.get('schedule', '(none)')}, hooks run as {cfg['user']}")
+    for src in cfg["source"]:
+        services, loose = discover(Path(src["path"]))
+        log(f"\n[{src['name']}] {src['path']}" + (f"  (all: exclude {src['exclude']})" if src.get("exclude") else ""))
+        for s in services:
+            if not s.has_rules:
+                log(f"  {s.name}")
+                continue
+            if s.skip:
+                log(f"  {s.name}: SKIPPED")
+                continue
+            bits = []
+            if s.exclude: bits.append(f"exclude {s.exclude}")
+            if s.dumps: bits.append("dump " + ", ".join(f"{d.name}" + (f" ({d.container})" if d.container else "") for d in s.dumps))
+            if s.before: bits.append("before hook" + (f" (if {s.if_running} runs)" if s.if_running else ""))
+            if s.stop: bits.append(f"stop {s.stop}")
+            if s.after: bits.append("after hook")
+            log(f"  {s.name}: " + "; ".join(bits or ["rules file, nothing special"]))
+        if loose:
+            log(f"  (loose files) {', '.join(p.name for p in loose)}")
+    if errors:
+        sys.exit(1)
+
+
+def cmd_timer(cfg: dict) -> None:
+    if os.geteuid() != 0:
+        die("timer needs root: sudo kivotos timer")
+    sched = cfg.get("schedule")
+    if not sched:
+        die(f"{CONFIG}: no 'schedule'")
+    if subprocess.run(["systemd-analyze", "calendar", sched], capture_output=True).returncode != 0:
+        die(f"schedule {sched!r} isn't a valid systemd OnCalendar expression")
+    delay = cfg.get("randomized_delay", "0")
+    TIMER.write_text(
+        "# Written by `kivotos timer` from /etc/kivotos/config.toml. Edit the config, not this file.\n"
+        "[Unit]\nDescription=kivotos backups\n\n"
+        f"[Timer]\nOnCalendar={sched}\nRandomizedDelaySec={delay}\nPersistent=true\n\n"
+        "[Install]\nWantedBy=timers.target\n")
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "enable", "--now", "kivotos.timer"], check=True)
+    subprocess.run(["systemctl", "list-timers", "kivotos.timer", "--no-pager"])
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    cmd, rest = args[0], args[1:]
+    cfg = load_config()
+    if cmd == "run":
+        dry = "--dry-run" in rest
+        cmd_run(cfg, [a for a in rest if a != "--dry-run"], dry)
+    elif cmd == "plan":
+        cmd_plan(cfg)
+    elif cmd == "timer":
+        cmd_timer(cfg)
+    elif cmd == "restic":
+        restic_env(cfg)
+        os.execvp("restic", ["restic", *rest])
+    else:
+        die(f"unknown command {cmd!r}, see kivotos --help")
+
+
+if __name__ == "__main__":
+    main()
