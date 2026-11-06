@@ -7,11 +7,12 @@
   sudo kivotos restic ARGS ...             any restic command against the repo
 
 Host settings:  /etc/kivotos/config.toml   (root-owned)
-Service rules:  <source>/<svc>/kivotos.toml (optional, owned by the service user)
+Service rules:  <source>/<svc>/kivotos.toml (optional, must be owned by the source's user or root)
 
 Security model: kivotos runs as root so it can read files owned by container subuids and write
-a repo the service user can't touch. Service rules are only parsed as data. Every hook, dump
-and podman call runs as the unprivileged `user` from the config, never as root.
+a repo the users can't touch. Service rules are only parsed as data. Every hook, dump and podman
+call runs as the source's unprivileged `user` (per source, defaulting to the top-level one),
+never as root, and only rules files owned by that user are honoured.
 """
 
 import os
@@ -86,15 +87,22 @@ def load_config() -> dict:
             die(f"{CONFIG}: missing '{key}'")
     if not cfg.get("source"):
         die(f"{CONFIG}: no [[source]] entries")
-    try:
-        pwd.getpwnam(cfg["user"])
-    except KeyError:
-        die(f"{CONFIG}: user {cfg['user']!r} doesn't exist on this machine")
+    for src in cfg["source"]:
+        for key in ("name", "path"):
+            if not isinstance(src.get(key), str):
+                die(f"{CONFIG}: a [[source]] is missing '{key}'")
+        src.setdefault("user", cfg["user"])
+        for u in {cfg["user"], src["user"]}:
+            try:
+                pwd.getpwnam(u)
+            except KeyError:
+                die(f"{CONFIG}: user {u!r} (source {src['name']}) doesn't exist on this machine")
     return cfg
 
 
-def read_rules(path: Path) -> dict | None:
-    """Parse a service's kivotos.toml as data. Refuses symlinks and anything but a regular file."""
+def read_rules(path: Path, owner: str) -> dict | None:
+    """Parse a service's kivotos.toml as data. Refuses symlinks, anything but a regular file, and
+    files not owned by `owner` or root (their hooks run as `owner`, so only `owner` may write them)."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -102,8 +110,15 @@ def read_rules(path: Path) -> dict | None:
     except OSError as e:
         raise ValueError(f"can't open safely ({e.strerror})")
     with os.fdopen(fd, "rb") as f:
-        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
             raise ValueError("not a regular file")
+        if st.st_uid not in (0, pwd.getpwnam(owner).pw_uid):
+            try:
+                who = pwd.getpwuid(st.st_uid).pw_name
+            except KeyError:
+                who = f"uid {st.st_uid}"
+            raise ValueError(f"owned by {who}, but this source's hooks run as {owner}; only {owner} or root may own it")
         try:
             return tomllib.load(f)
         except tomllib.TOMLDecodeError as e:
@@ -128,11 +143,16 @@ def anchor(base: Path, pattern: str) -> list[str]:
     return [f"{base}/{rel}", f"{base}/**/{rel}"]
 
 
-def source_path(cfg: dict, src: dict) -> Path:
-    """Source paths may start with ~, which means the configured user's home (not root's)."""
+def source_path(src: dict) -> Path:
+    """'~' or '~/x' is the source user's home (not root's), '~name/x' is that user's home."""
     p = src["path"]
-    if p == "~" or p.startswith("~/"):
-        p = pwd.getpwnam(cfg["user"]).pw_dir + p[1:]
+    if p.startswith("~"):
+        name, _, rest = p[1:].partition("/")
+        try:
+            home = pwd.getpwnam(name or src["user"]).pw_dir
+        except KeyError:
+            die(f"{CONFIG}: source {src['name']}: no user {name!r} for {p!r}")
+        p = home + ("/" + rest if rest else "")
     return Path(p)
 
 
@@ -177,14 +197,14 @@ def parse_service(path: Path, rules: dict) -> Service:
     return svc
 
 
-def discover(source: Path) -> tuple[list[Service], list[Path]]:
+def discover(source: Path, owner: str) -> tuple[list[Service], list[Path]]:
     """Each real (non-symlink) directory under the source is a service. Returns services + loose files."""
     services, loose = [], []
     for entry in sorted(os.scandir(source), key=lambda e: e.name.lower()):
         path = Path(entry.path)
         if entry.is_dir(follow_symlinks=False):
             try:
-                rules = read_rules(path / RULES)
+                rules = read_rules(path / RULES, owner)
                 services.append(parse_service(path, rules) if rules is not None else Service(path.name, path))
             except ValueError as e:
                 error(f"{path / RULES}: {e}. Backing up {path.name} with no rules")
@@ -313,15 +333,15 @@ def backup_service(svc: Service, src: dict, user: User, dry: bool) -> None:
 def cmd_run(cfg: dict, only: list[str], dry: bool) -> None:
     if os.geteuid() != 0:
         die("run needs root: sudo kivotos run")
-    user = User(cfg["user"])
     restic_env(cfg)
     seen = set()
     for src in cfg["source"]:
-        root = source_path(cfg, src)
+        user = User(src["user"])
+        root = source_path(src)
         if not root.is_dir():
             error(f"source {src['name']}: {root} doesn't exist")
             continue
-        services, loose = discover(root)
+        services, loose = discover(root, src["user"])
         for svc in services:
             if only and svc.name not in only:
                 continue
@@ -355,10 +375,12 @@ def cmd_run(cfg: dict, only: list[str], dry: bool) -> None:
 
 
 def cmd_plan(cfg: dict) -> None:
-    log(f"repo {cfg['repository']}, schedule {cfg.get('schedule', '(none)')}, hooks run as {cfg['user']}")
+    log(f"repo {cfg['repository']}, schedule {cfg.get('schedule', '(none)')}")
     for src in cfg["source"]:
-        services, loose = discover(source_path(cfg, src))
-        log(f"\n[{src['name']}] {source_path(cfg, src)}" + (f"  (all: exclude {src['exclude']})" if src.get("exclude") else ""))
+        root = source_path(src)
+        services, loose = discover(root, src["user"])
+        log(f"\n[{src['name']}] {root}, hooks run as {src['user']}"
+            + (f"  (all: exclude {src['exclude']})" if src.get("exclude") else ""))
         for s in services:
             if not s.has_rules:
                 log(f"  {s.name}")
@@ -390,7 +412,7 @@ def cmd_units(cfg: dict) -> None:
     delay = cfg.get("randomized_delay", "0")
     head = f"# Written by `kivotos units` from {CONFIG}. Edit the config, not this file.\n"
     # Don't run against an empty mountpoint: wait for the sources and a local repo to be mounted
-    mounts = [str(source_path(cfg, s)) for s in cfg["source"]]
+    mounts = [str(source_path(s)) for s in cfg["source"]]
     if cfg["repository"].startswith("/"):
         mounts.append(cfg["repository"])
     exe = Path(sys.argv[0]).resolve()

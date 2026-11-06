@@ -104,7 +104,8 @@ file      = "foo.sql"         # stored as <svc>/foo.sql (default: <name>.dump)
 kivotos runs as **root**, for two reasons. It has to read files owned by container subuids, and the repo must be out of reach of your user, so ransomware running as your user can't touch it.
 `kivotos.toml` files belong to your user, so root treats them strictly as **data**:
 
-- Hooks, dump commands and every `podman` call run as `user` from the config, through `runuser` with a clean environment. **Nothing from a `kivotos.toml` is ever executed as root.** Root only stores the output.
+- Hooks, dump commands and every `podman` call run as the source's `user`, through `runuser` with a clean environment. **Nothing from a `kivotos.toml` is ever executed as root.** Root only stores the output.
+- A `kivotos.toml` is only honoured if it's owned by that `user` or by root. Anything else (another user's file, a file a container wrote with its subuid) is ignored and reported, and the service is backed up with no rules. So nobody can get commands run as someone else.
 - Excludes are anchored inside the service directory. `..` and `!` are rejected.
 - Symlinked service dirs and a symlinked `kivotos.toml` are refused. Root never follows them out of the tree.
 - The worst a tampered `kivotos.toml` can do is skip or exclude its own service's data. A `*` exclude is reported as a problem. `kivotos plan` shows everything that's set.
@@ -169,14 +170,29 @@ podman exec -i postgres-db psql -U <db-user> -d postgres < ~/postgres-all.sql
 
 ## Adding a source
 
-To back up another tree of services, add a `[[source]]` block to `/etc/kivotos/config.toml`. Nothing else is needed:
+To back up another tree of services, add a `[[source]]` block to `/etc/kivotos/config.toml`, then run `sudo kivotos units`:
 
 ```toml
 [[source]]
 name = "projects"
-path = "~/Projects"           # ~ is the home of `user` from the config
+path = "~/Projects"           # ~ is the home of this source's user
 exclude = ["node_modules", "target", ".venv"]   # applied inside every service of this source
 ```
+
+### Several users
+
+Each source can have its own `user`, which defaults to the top-level one.
+Rootless podman is per user, so a source's hooks and dumps have to run as the user who owns its containers:
+
+```toml
+[[source]]
+name = "trowe"
+path = "~/Containers"         # ~ is this source's user, so /home/trowe/Containers. "~nn/x" names a user explicitly.
+user = "trowe"
+```
+
+All sources share one repo. Only root can read it, so users can't see each other's backups, and deduplication works across everyone.
+The flip side is that only root can restore. Snapshots carry the source name as a tag (`--tag trowe`).
 
 # ☦
 

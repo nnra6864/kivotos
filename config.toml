@@ -10,6 +10,7 @@ schedule         = "*-*-* 04:30"
 randomized_delay = "15m"
 
 # Hooks, dumps and podman commands run as this user, never as root. install.sh fills in whoever ran sudo.
+# A [[source]] can set its own `user` (see README, "Several users").
 user = "your-user"
 
 # Kept per service (per backed-up path); everything older is pruned
@@ -22,5 +23,5 @@ monthly = 6
 # A service's own rules go in <path>/<service>/kivotos.toml (see README).
 [[source]]
 name    = "containers"
-path    = "~/Containers"   # ~ is the home of `user`, not root's
+path    = "~/Containers"   # ~ is the home of this source's user, not root's
 exclude = []   # applied inside every service of this source, same syntax as the per-service exclude
