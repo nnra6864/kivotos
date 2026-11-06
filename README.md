@@ -94,7 +94,7 @@ after  = "podman exec foo some-resume-command"
 
 [[dump]]                      # as many as you like
 name      = "foo-db"          # letters, digits, . _ -
-container = "foo-db"          # run with `podman exec` in this container; leave it out to run on the host as `user`
+container = "foo-db"          # run with `podman exec` in this container; leave it out to run on the host as `user`, in this dir
 command   = "pg_dumpall -U postgres"   # stdout is what gets stored
 file      = "foo.sql"         # stored as <svc>/foo.sql (default: <name>.dump)
 ```
@@ -120,7 +120,7 @@ Copying a database's files while it's writing to them can give a backup that won
 | Kind | Examples here | What to do |
 |---|---|---|
 | Postgres / MySQL / MariaDB | `postgres-db` | Add a `[[dump]]`, and exclude the raw data dir |
-| SQLite | Grafana, NetBird, n8n | Fine for small apps that rarely write. For important ones, use the SQLite `[[dump]]` recipe below if the image has sqlite3, or use `stop` |
+| SQLite | Grafana, NetBird, Mumble | A `[[dump]]` with the host's `sqlite3 .dump` (recipe below): a consistent snapshot while the app keeps running, whatever is in the image |
 | RocksDB / LevelDB / embedded KV | tuwunel (on `/tank`) | `stop` the container, or keep the data on `/tank`: ZFS snapshots are atomic, like a power cut, which databases are built to survive |
 | Redis / Valkey | `searxng-valkey` (cache) | Usually not worth it. Otherwise use a `before` hook with `redis-cli SAVE` |
 
@@ -133,11 +133,10 @@ container = "foo-db"
 command   = 'mariadb-dump --all-databases -uroot -p"$MARIADB_ROOT_PASSWORD"'
 file      = "mariadb.sql"
 
-[[dump]]   # SQLite, if the image has sqlite3
-name      = "app-db"
-container = "foo"
-command   = "sqlite3 /data/app.db '.backup /tmp/kivotos.db' && cat /tmp/kivotos.db && rm /tmp/kivotos.db"
-file      = "app.db"
+[[dump]]   # SQLite, using the host's sqlite3. podman unshare lets it read files owned by container subuids.
+name    = "app-db"
+command = "podman unshare sqlite3 data/app.db .dump"   # relative to this service's dir
+file    = "app.sql"                                    # restore: sqlite3 app.db < app.sql
 ```
 
 Rule of thumb: a busy, important database goes on `/tank/services/<svc>`. A small app database can stay in `~/Containers`. A database server gets a `[[dump]]`.

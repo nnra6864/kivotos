@@ -253,8 +253,8 @@ def restic_env(cfg: dict) -> None:
     os.environ["RESTIC_CACHE_DIR"] = cfg.get("cache_dir", "/var/cache/kivotos")
 
 
-def restic(*args: str) -> bool:
-    r = subprocess.run(["restic", *args], cwd="/")
+def restic(*args: str, cwd: Path | str = "/") -> bool:
+    r = subprocess.run(["restic", *args], cwd=cwd)
     if r.returncode == 3:
         error(f"restic {args[0]}: some files couldn't be read (snapshot was still saved)")
     elif r.returncode != 0:
@@ -290,7 +290,7 @@ def backup_service(svc: Service, src: dict, user: User, dry: bool) -> None:
         log(f"   dump {d.name} -> {svc.name}/{d.file}")
         cmd = ["podman", "exec", d.container, "sh", "-c", d.command] if d.container else ["sh", "-c", d.command]
         restic("backup", *tags, "--tag", "dump", "--stdin-filename", f"{svc.name}/{d.file}",
-               "--stdin-from-command", "--", *user.argv(*cmd))
+               "--stdin-from-command", "--", *user.argv(*cmd), cwd=svc.path)
 
     # 2. Quiesce: before hook, then stop containers
     stopped = []
