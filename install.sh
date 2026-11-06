@@ -1,6 +1,6 @@
 #!/bin/sh
 # Installs kivotos. Run as: sudo sh ~/Packages/kivotos/install.sh
-# Safe to run again: updates the program and the service unit and rewrites the timer from the config.
+# Safe to run again: updates the program and rewrites the systemd service and timer from the config.
 # It never overwrites /etc/kivotos/config.toml or the password, and never touches a repo it can open.
 set -eu
 cd "$(dirname "$0")"
@@ -8,7 +8,6 @@ cd "$(dirname "$0")"
 
 install -Dm755 kivotos /usr/local/bin/kivotos
 install -d -m755 /etc/kivotos
-install -m644 kivotos.service /etc/systemd/system/kivotos.service
 [ -f /etc/kivotos/config.toml ] || install -m644 config.toml /etc/kivotos/config.toml
 
 # --- migrate from restic-containers --------------------------------------------------------------
@@ -43,5 +42,5 @@ else
     exit 1
 fi
 
-kivotos timer
+kivotos units
 echo ">> Installed. Check the plan with: kivotos plan   Back up now: sudo systemctl start kivotos   Logs: journalctl -fu kivotos"

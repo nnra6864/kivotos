@@ -1,5 +1,5 @@
 # kivotos host settings. Installed to /etc/kivotos/config.toml (only if it doesn't exist yet).
-# After changing `schedule` or `randomized_delay`, run:  sudo kivotos timer
+# After changing `schedule`, `randomized_delay`, `repository` or a source `path`, run:  sudo kivotos units
 
 repository    = "/tank/backups/containers/restic"
 password_file = "/etc/kivotos/password"
@@ -22,5 +22,5 @@ monthly = 6
 # A service's own rules go in <path>/<service>/kivotos.toml (see README).
 [[source]]
 name    = "containers"
-path    = "/home/nn/Containers"
+path    = "~/Containers"   # ~ is the home of `user`, not root's
 exclude = []   # applied inside every service of this source, same syntax as the per-service exclude

@@ -1,6 +1,9 @@
 # kivotos
 
-*Κιβωτός*, the ark: keeps things safe through the flood.
+kivotos (Κιβωτός) - the ark keeping things safe through the flood
+
+> [!WARNING]
+> This was made with Claude Opus 5.5 mostly for personal use.
 
 Restic backups of service directories. Each service's backup rules live next to it in a `kivotos.toml`,
 so a service directory carries its own backup rules wherever you move it.
@@ -15,7 +18,7 @@ One Python file, standard library only. It needs restic ≥ 0.17 and Python ≥ 
 sudo sh ~/Packages/kivotos/install.sh
 ```
 
-You can run it again at any time. It installs `/usr/local/bin/kivotos` and `kivotos.service`, and writes the timer from the config.
+You can run it again at any time. It installs `/usr/local/bin/kivotos` and writes the systemd service and timer from the config.
 It creates `/etc/kivotos/config.toml` only if it's missing, so your edits there are kept.
 **Re-run it after changing the program in this folder.** It also cleans up the older `restic-containers` setup (units, `/etc/restic`) and moves its password over.
 
@@ -37,11 +40,11 @@ sudo kivotos run --dry-run           # what restic would back up; no hooks, dump
 systemctl list-timers kivotos        # next and last run
 sudo kivotos restic <anything>       # any restic command against the repo, for example:
 sudo kivotos restic snapshots --tag NetBird
-sudo kivotos restic ls latest --path /home/nn/Containers/NetBird
+sudo kivotos restic ls latest --path ~/Containers/NetBird
 sudo kivotos restic stats --mode raw-data
 ```
 
-Change the schedule in `/etc/kivotos/config.toml` (`sudoedit` it), then run `sudo kivotos timer` to rewrite the timer.
+Change the schedule in `/etc/kivotos/config.toml` (`sudoedit` it), then run `sudo kivotos units` to rewrite the units.
 
 ## What a run does
 
@@ -60,7 +63,7 @@ For each service, in this order:
 Then comes **retention** (per backed-up path: 7 daily, 4 weekly, 6 monthly by default), then `restic check`.
 
 kivotos doesn't stop at the first problem: it carries on and backs up everything else.
-Afterwards it lists every problem and exits with 1, so the service fails and sema's `OnFailure=` hook sends a Matrix alert.
+Afterwards it lists every problem and exits with 1.
 Examples of problems: a failed hook or dump, a broken `kivotos.toml`, or an unreadable file.
 A container that isn't running is not an error. Its dumps and `if_running` hooks are just skipped.
 
@@ -70,41 +73,32 @@ A container that isn't running is not an error. Its dumps and `if_running` hooks
 Add a `kivotos.toml` only for special cases. Every key is optional:
 
 ```toml
-# Like .gitignore: "name" matches at any depth, "a/b" or "/name" is relative to this dir.
-# No '!' negation and no '..'. Patterns can't reach outside the service dir.
-exclude = ["cache", "data/dind"]
+# "./name" or "a/b" is relative to this dir, a bare "name" matches at any depth.
+# No '!' negation, no '..' and no leading '/'. Patterns can't reach outside the service dir.
+exclude = ["./cache", "data/dind", "node_modules"]
 
 skip = false                  # true: don't back up this service at all
 
 stop = ["foo", "foo-worker"]  # stopped for this service's backup (only if running), started again after
 
-[hooks]                       # shell commands, run as `nn` in this service's dir
+[hooks]                       # shell commands, run as the configured `user` in this service's dir
 if_running = "foo"            # only run the hooks while this container is up
 before = "podman exec foo some-flush-command"
 after  = "podman exec foo some-resume-command"
 
 [[dump]]                      # as many as you like
 name      = "foo-db"          # letters, digits, . _ -
-container = "foo-db"          # run with `podman exec` in this container; leave it out to run on the host as nn
+container = "foo-db"          # run with `podman exec` in this container; leave it out to run on the host as `user`
 command   = "pg_dumpall -U postgres"   # stdout is what gets stored
 file      = "foo.sql"         # stored as <svc>/foo.sql (default: <name>.dump)
 ```
 
-The ones in use now:
-
-| Service | Rules |
-|---|---|
-| `Postgres` | excludes `data/db`, dumps `pg_dumpall` from `postgres-db` |
-| `minecraft-NnSurvival` | `save-off` + `save-all flush` before, `save-on` after (only while `nn-survival` runs) |
-| `forgejo` | excludes `data/dind` (CI image cache) |
-| `omnisearch` | excludes `/cache` |
-
 ### Security
 
-kivotos runs as **root**, for two reasons. It has to read files owned by container subuids, and the repo must be out of reach of your user, so ransomware running as `nn` can't touch it.
+kivotos runs as **root**, for two reasons. It has to read files owned by container subuids, and the repo must be out of reach of your user, so ransomware running as your user can't touch it.
 `kivotos.toml` files belong to your user, so root treats them strictly as **data**:
 
-- Hooks, dump commands and every `podman` call run as `user` from the config (`nn`), through `runuser` with a clean environment. **Nothing from a `kivotos.toml` is ever executed as root.** Root only stores the output.
+- Hooks, dump commands and every `podman` call run as `user` from the config, through `runuser` with a clean environment. **Nothing from a `kivotos.toml` is ever executed as root.** Root only stores the output.
 - Excludes are anchored inside the service directory. `..` and `!` are rejected.
 - Symlinked service dirs and a symlinked `kivotos.toml` are refused. Root never follows them out of the tree.
 - The worst a tampered `kivotos.toml` can do is skip or exclude its own service's data. A `*` exclude is reported as a problem. `kivotos plan` shows everything that's set.
@@ -119,7 +113,7 @@ Copying a database's files while it's writing to them can give a backup that won
 | Kind | Examples here | What to do |
 |---|---|---|
 | Postgres / MySQL / MariaDB | `postgres-db` | Add a `[[dump]]`, and exclude the raw data dir |
-| SQLite | grafana, NetBird, n8n | Fine for small apps that rarely write. For important ones, use the SQLite `[[dump]]` recipe below if the image has sqlite3, or use `stop` |
+| SQLite | Grafana, NetBird, n8n | Fine for small apps that rarely write. For important ones, use the SQLite `[[dump]]` recipe below if the image has sqlite3, or use `stop` |
 | RocksDB / LevelDB / embedded KV | tuwunel (on `/tank`) | `stop` the container, or keep the data on `/tank`: ZFS snapshots are atomic, like a power cut, which databases are built to survive |
 | Redis / Valkey | `searxng-valkey` (cache) | Usually not worth it. Otherwise use a `before` hook with `redis-cli SAVE` |
 
@@ -147,24 +141,24 @@ Stop the service first: `cd ~/Containers/<svc> && podman compose down`.
 
 ```sh
 # One service, in place. Files come back with their original subuid owners.
-sudo kivotos restic restore latest --path /home/nn/Containers/NetBird --target /
+sudo kivotos restic restore latest --path ~/Containers/NetBird --target /
 
 # Somewhere else first, to look around
-sudo kivotos restic restore latest --path /home/nn/Containers/NetBird --target /tmp/restore
+sudo kivotos restic restore latest --path ~/Containers/NetBird --target /tmp/restore
 
 # A single file or folder from an older snapshot
 sudo kivotos restic snapshots --tag NetBird
-sudo kivotos restic restore <id> --target /tmp/restore --include /home/nn/Containers/NetBird/config.yaml
+sudo kivotos restic restore <id> --target /tmp/restore --include ~/Containers/NetBird/config.yaml
 
 # Browse everything as a filesystem (Ctrl-C to unmount)
 sudo mkdir -p /mnt/kivotos && sudo kivotos restic mount /mnt/kivotos
 ```
 
-Postgres from the dump (the DB user is `nn`). Use it on an empty or fresh cluster, because roles and databases that already exist will error:
+Postgres from the dump (`<db-user>` is your `POSTGRES_USER`). Use it on an empty or fresh cluster, because roles and databases that already exist will error:
 
 ```sh
 sudo kivotos restic dump latest Postgres/postgres-all.sql --path /Postgres/postgres-all.sql > ~/postgres-all.sql
-podman exec -i postgres-db psql -U nn -d postgres < ~/postgres-all.sql
+podman exec -i postgres-db psql -U <db-user> -d postgres < ~/postgres-all.sql
 ```
 
 ## Adding a source
@@ -174,19 +168,30 @@ To back up another tree of services, add a `[[source]]` block to `/etc/kivotos/c
 ```toml
 [[source]]
 name = "projects"
-path = "/home/nn/Projects"
+path = "~/Projects"           # ~ is the home of `user` from the config
 exclude = ["node_modules", "target", ".venv"]   # applied inside every service of this source
 ```
 
-## Off-site copy (later)
+# ☦
 
-The repo is on the same single HDD as `/tank`, so it covers losing the SSD but not losing the HDD.
-For a second copy, make a repo elsewhere (USB disk, B2, Hetzner Storage Box, another box over NetBird) and copy snapshots into it:
-
-```sh
-restic -r <new-repo> --password-file <new-pw> init
-restic -r <new-repo> --password-file <new-pw> copy \
-    --from-repo /tank/backups/containers/restic --from-password-file /etc/kivotos/password
+```
+   Ὤ
+ Ὁ   Ν
+Ι̅Ϲ̅ │ Χ̅Ϲ̅
+───┼───
+ΝΙ │ ΚΑ
+   ☦
 ```
 
-The repo is encrypted, so an untrusted host is fine.
+Εἰς δόξαν τοῦ Θεοῦ<br>
+*To the glory of God*
+
+Τῇ Ὑπεραγίᾳ Θεοτόκῳ δόξα<br>
+*Glory to the Most Holy Theotokos*
+
+Δόξα τῷ Θεῷ πάντων ἕνεκεν<br>
+*Glory to God for all things*
+
+ΑΜΗΝ
+
+☦

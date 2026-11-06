@@ -3,7 +3,7 @@
 
   sudo kivotos run [SVC ...] [--dry-run]   back up every service (or only the ones named)
   kivotos plan                             show what a run would do (no root needed)
-  sudo kivotos timer                       (re)write the systemd timer from the config
+  sudo kivotos units                       (re)write the systemd service and timer from the config
   sudo kivotos restic ARGS ...             any restic command against the repo
 
 Host settings:  /etc/kivotos/config.toml   (root-owned)
@@ -23,11 +23,11 @@ import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 CONFIG = Path(os.environ.get("KIVOTOS_CONFIG", "/etc/kivotos/config.toml"))
 RULES = "kivotos.toml"
-TIMER = Path("/etc/systemd/system/kivotos.timer")
+UNITS = Path("/etc/systemd/system")
 HOOK_TIMEOUT = 15 * 60
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -105,16 +105,30 @@ def read_rules(path: Path) -> dict | None:
             raise ValueError(str(e))
 
 
+def excludes_everything(pattern: str) -> bool:
+    return str(PurePosixPath(pattern.strip())) in (".", "*", "**", "./*", "./**")
+
+
 def anchor(base: Path, pattern: str) -> list[str]:
-    """gitignore-ish pattern -> restic exclude patterns that can't reach outside `base`.
-    'a/b' (contains a slash) is relative to base, 'name' matches at any depth under base."""
+    """Exclude pattern -> restic patterns that can't reach outside `base`.
+    './x' and 'a/b' (any slash) are relative to base; a bare 'name' matches at any depth under base."""
     p = pattern.strip()
-    if not p or p.startswith("!") or ".." in Path(p).parts:
+    if not p or p.startswith("!") or ".." in PurePosixPath(p).parts:
         raise ValueError(f"bad exclude pattern {pattern!r} (no '!', no '..')")
-    if "/" in p.rstrip("/"):
-        return [f"{base}/{p.strip('/')}"]
-    p = p.rstrip("/")
-    return [f"{base}/{p}", f"{base}/**/{p}"]
+    if p.startswith("/"):
+        raise ValueError(f"exclude {pattern!r} looks absolute, write './{p.lstrip('/')}' for a path in this dir")
+    rel = str(PurePosixPath(p))          # drops a leading './', duplicate and trailing slashes
+    if p.startswith("./") or "/" in rel:
+        return [f"{base}/{rel}"]
+    return [f"{base}/{rel}", f"{base}/**/{rel}"]
+
+
+def source_path(cfg: dict, src: dict) -> Path:
+    """Source paths may start with ~, which means the configured user's home (not root's)."""
+    p = src["path"]
+    if p == "~" or p.startswith("~/"):
+        p = pwd.getpwnam(cfg["user"]).pw_dir + p[1:]
+    return Path(p)
 
 
 def str_list(value, what: str) -> list[str]:
@@ -237,7 +251,7 @@ def backup_service(svc: Service, src: dict, user: User, dry: bool) -> None:
             log(f"   exclude {p}")
         except ValueError as e:
             error(f"{svc.name}: {e}")
-    if any(p.strip().strip("/") in ("*", "**") for p in svc.exclude):
+    if any(excludes_everything(p) for p in svc.exclude):
         error(f"{svc.name}: excludes everything ({svc.path / RULES})")
 
     # 1. Dumps, while everything is still running
@@ -298,7 +312,7 @@ def cmd_run(cfg: dict, only: list[str], dry: bool) -> None:
     restic_env(cfg)
     seen = set()
     for src in cfg["source"]:
-        root = Path(src["path"])
+        root = source_path(cfg, src)
         if not root.is_dir():
             error(f"source {src['name']}: {root} doesn't exist")
             continue
@@ -338,8 +352,8 @@ def cmd_run(cfg: dict, only: list[str], dry: bool) -> None:
 def cmd_plan(cfg: dict) -> None:
     log(f"repo {cfg['repository']}, schedule {cfg.get('schedule', '(none)')}, hooks run as {cfg['user']}")
     for src in cfg["source"]:
-        services, loose = discover(Path(src["path"]))
-        log(f"\n[{src['name']}] {src['path']}" + (f"  (all: exclude {src['exclude']})" if src.get("exclude") else ""))
+        services, loose = discover(source_path(cfg, src))
+        log(f"\n[{src['name']}] {source_path(cfg, src)}" + (f"  (all: exclude {src['exclude']})" if src.get("exclude") else ""))
         for s in services:
             if not s.has_rules:
                 log(f"  {s.name}")
@@ -360,18 +374,27 @@ def cmd_plan(cfg: dict) -> None:
         sys.exit(1)
 
 
-def cmd_timer(cfg: dict) -> None:
+def cmd_units(cfg: dict) -> None:
     if os.geteuid() != 0:
-        die("timer needs root: sudo kivotos timer")
+        die("units needs root: sudo kivotos units")
     sched = cfg.get("schedule")
     if not sched:
         die(f"{CONFIG}: no 'schedule'")
     if subprocess.run(["systemd-analyze", "calendar", sched], capture_output=True).returncode != 0:
         die(f"schedule {sched!r} isn't a valid systemd OnCalendar expression")
     delay = cfg.get("randomized_delay", "0")
-    TIMER.write_text(
-        "# Written by `kivotos timer` from /etc/kivotos/config.toml. Edit the config, not this file.\n"
-        "[Unit]\nDescription=kivotos backups\n\n"
+    head = f"# Written by `kivotos units` from {CONFIG}. Edit the config, not this file.\n"
+    # Don't run against an empty mountpoint: wait for the sources and a local repo to be mounted
+    mounts = [str(source_path(cfg, s)) for s in cfg["source"]]
+    if cfg["repository"].startswith("/"):
+        mounts.append(cfg["repository"])
+    exe = Path(sys.argv[0]).resolve()
+    (UNITS / "kivotos.service").write_text(
+        head + "[Unit]\nDescription=kivotos backups\n"
+        f"RequiresMountsFor={' '.join(shlex.quote(m) for m in mounts)}\n\n"
+        f"[Service]\nType=oneshot\nExecStart={exe} run\nNice=10\nIOSchedulingClass=idle\n")
+    (UNITS / "kivotos.timer").write_text(
+        head + "[Unit]\nDescription=kivotos backups\n\n"
         f"[Timer]\nOnCalendar={sched}\nRandomizedDelaySec={delay}\nPersistent=true\n\n"
         "[Install]\nWantedBy=timers.target\n")
     subprocess.run(["systemctl", "daemon-reload"], check=True)
@@ -391,8 +414,8 @@ def main() -> None:
         cmd_run(cfg, [a for a in rest if a != "--dry-run"], dry)
     elif cmd == "plan":
         cmd_plan(cfg)
-    elif cmd == "timer":
-        cmd_timer(cfg)
+    elif cmd == "units":
+        cmd_units(cfg)
     elif cmd == "restic":
         restic_env(cfg)
         os.execvp("restic", ["restic", *rest])
