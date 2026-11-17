@@ -5,10 +5,15 @@ kivotos (Κιβωτός) - the ark keeping things safe through the flood
 > [!WARNING]
 > This was made with Claude Opus 5.5 mostly for personal use.
 
-Restic backups of service directories. Each service's backup rules live next to it in a `kivotos.toml`,
+Backups of service directories. Each service's backup rules live next to it in a `kivotos.toml`,
 so a service directory carries its own backup rules wherever you move it.
-Right now it backs up `~/Containers`, which sits on the SSD (ext4) and so gets no ZFS snapshots.
-Everything on `/tank` is covered by sanoid instead (`/etc/sanoid/sanoid.conf`).
+
+It has two backends, picked with `backend` in `/etc/kivotos/config.toml`:
+
+- **`restic`** (the default): kivotos copies every service into a restic repo on its own timer.
+  Works on any filesystem and to any restic target (local, sftp, S3, ...), so it's the one for offsite copies.
+- **`zfs`**: the sources are on ZFS, and sanoid snapshots the whole dataset. kivotos runs each service's
+  dumps and hooks right before and after every snapshot. See [ZFS backend](#zfs-backend).
 
 One Python file, standard library only. It needs restic ≥ 0.17 and Python ≥ 3.11.
 
@@ -72,6 +77,46 @@ To be alerted, hang an `OnFailure=` on the service with `sudo systemctl edit kiv
 That drop-in survives `kivotos units`, which only rewrites the unit files themselves.
 [sema](../../../sema) does this for every system service and sends the alert to Matrix, so with its `onfailure` module on, there's nothing to set up here.
 A container that isn't running is not an error. Its dumps and `if_running` hooks are just skipped.
+
+## ZFS backend
+
+With `backend = "zfs"`, kivotos has no timer, repo or retention of its own. sanoid snapshots the
+dataset your sources live on (`/etc/sanoid/sanoid.conf`), and calls kivotos around each snapshot:
+
+```ini
+[zroot/home]                     # the dataset ~/Containers is on (`kivotos plan` tells you)
+    pre_snapshot_script = /usr/local/bin/kivotos hook
+    post_snapshot_script = /usr/local/bin/kivotos hook
+    force_post_snapshot_script = yes   # run `after` hooks even if a `before` one failed
+    script_timeout = 900
+```
+
+`sudo kivotos units` removes the restic timer and tells you if that section is missing. `kivotos plan` does too.
+
+A ZFS snapshot is the **whole dataset at one instant**, like pulling the power cord, in zero time.
+That changes what the rules mean:
+
+| Rule | On zfs |
+|---|---|
+| `[hooks]` | Run as usual: `before` right before each snapshot, `after` right after it. Every snapshot (hourly), so keep them quick. |
+| `[[dump]]` | Written to `<svc>/.kivotos/<file>` right before the snapshot, so the snapshot holds it. Only on the snapshot types in `[zfs] dump_on` (default `daily`). A failed dump keeps the last good one. |
+| `exclude` | **Does nothing.** ZFS can't leave out part of a dataset. Mount caches *outside* the snapshotted dataset instead (`/var/cache/containers/<svc>/...` on the SSD, `/tank/cache/<svc>/...` on the HDD, neither snapshotted). `kivotos plan` warns about leftover excludes. |
+| `stop` | Ignored. Nothing needs stopping for an instant snapshot. |
+| `skip` | Does nothing, for the same reason as `exclude`. |
+
+Databases are fine without dumps: Postgres, SQLite and RocksDB all recover from a power-cut copy,
+which is what a snapshot is. A dump is still handy to restore into a newer Postgres version, or one database alone.
+
+```sh
+kivotos plan                       # dataset per source, what runs, warnings
+sudo kivotos snapshot pre-upgrade  # hooks + a snapshot of every source's dataset now, named
+                                   # <dataset>@kivotos_pre-upgrade_<date>. sanoid never prunes these.
+journalctl -u sanoid               # what the hooks did (they log there)
+```
+
+Restoring: every snapshot is browsable read-only at `~/Containers/../.zfs/snapshot/<name>/` (the dataset's
+root, e.g. `/home/.zfs/snapshot/`). Copy files back with `sudo cp -a` to keep their subuid owners,
+or roll the whole dataset back with `sudo zfs rollback`.
 
 ## Per-service rules: `kivotos.toml`
 

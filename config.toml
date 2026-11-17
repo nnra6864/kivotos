@@ -1,5 +1,11 @@
 # kivotos host settings. install.sh copies this to /etc/kivotos/config.toml on the first run (never overwrites it).
-# After changing `schedule`, `randomized_delay`, `repository` or a source `path`, run:  sudo kivotos units
+# After changing `backend`, `schedule`, `randomized_delay`, `repository` or a source `path`, run:  sudo kivotos units
+
+# "restic": kivotos copies each service into a restic repo on its own timer (everything below applies).
+# "zfs": the sources sit on ZFS and sanoid snapshots them; kivotos only runs dumps and hooks around
+#        each snapshot (see README, "ZFS backend"). repository, password_file, schedule and retention
+#        are then unused, and `exclude`/`stop` do nothing.
+backend = "restic"
 
 repository    = "/tank/backups/kivotos"   # a local path, or any restic repo URL (sftp:, s3:, rest:, ...)
 password_file = "/etc/kivotos/password"
@@ -12,6 +18,10 @@ randomized_delay = "15m"
 # Hooks, dumps and podman commands run as this user, never as root. install.sh fills in whoever ran sudo.
 # A [[source]] can set its own `user` (see README, "Several users").
 user = "your-user"
+
+# zfs backend: sanoid snapshot types that also run the [[dump]]s (hooks run on every snapshot)
+[zfs]
+dump_on = ["daily"]
 
 # Kept per service (per backed-up path); everything older is pruned
 [retention]

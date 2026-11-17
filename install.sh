@@ -26,6 +26,13 @@ if [ ! -f "$CONFIG" ]; then
     exit 0
 fi
 
+# --- zfs backend: no repo, sanoid does the snapshots ---------------------------------------------
+if grep -Eq '^[[:space:]]*backend[[:space:]]*=[[:space:]]*"zfs"' "$CONFIG"; then
+    kivotos units
+    echo ">> Installed (zfs backend). Check the plan with: kivotos plan   Logs: journalctl -u sanoid"
+    exit 0
+fi
+
 # --- password and repo --------------------------------------------------------------------------
 if [ ! -s "$PASS" ]; then
     (umask 077; head -c 32 /dev/urandom | base64 > "$PASS")
