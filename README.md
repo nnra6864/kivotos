@@ -107,6 +107,35 @@ That changes what the rules mean:
 Databases are fine without dumps: Postgres, SQLite and RocksDB all recover from a power-cut copy,
 which is what a snapshot is. A dump is still handy to restore into a newer Postgres version, or one database alone.
 
+### Replication
+
+Snapshots on the same disk don't survive that disk. `[[zfs.replicate]]` in `/etc/kivotos/config.toml`
+sends a dataset tree's sanoid snapshots to another pool with syncoid (incremental: only changed blocks):
+
+```toml
+[[zfs.replicate]]
+from     = "zroot"                     # sent recursively
+to       = "tank/backups/ssd/zroot"    # created on the first run
+exclude  = ["zroot/var/cache"]         # datasets (and their children) left out
+schedule = "*-*-* *:20"                # systemd OnCalendar, default "hourly"
+before   = ["mountpoint -q /boot && rsync -a --delete /boot/ /tank/backups/boot/"]   # optional, as root
+# name   = "zroot"                     # unit name, default `from` with / -> -
+```
+
+`sudo kivotos units` writes `kivotos-replicate-<name>.service` and `.timer` for each entry (and removes ones
+you deleted). `sudo kivotos replicate [NAME]` runs them now. Only sanoid's own snapshots are sent, so the copy
+needs its own sanoid section with `autosnap = no` to prune it, with longer retention than the source, e.g.:
+
+```ini
+[tank/backups/ssd]
+    use_template = replica     # hourly = 48, daily = 30, weekly = 8, monthly = 12, autosnap = no
+    recursive = yes
+```
+
+`before` commands run as root, so kivotos refuses to run them unless the config is owned and writable only
+by root. Guard anything destructive: `mountpoint -q /boot &&` stops `rsync --delete` from emptying the copy
+when `/boot` isn't mounted. `kivotos plan` shows each side's sanoid retention and warns when nothing prunes `to`.
+
 ```sh
 kivotos plan                       # dataset per source, what runs, warnings
 sudo kivotos snapshot pre-upgrade  # hooks + a snapshot of every source's dataset now, named

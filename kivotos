@@ -14,6 +14,7 @@ restic:
 zfs:
   kivotos hook                             sanoid's pre/post_snapshot_script (reads SANOID_* env)
   sudo kivotos snapshot [LABEL]            hooks + a manual snapshot now (kept until you destroy it)
+  sudo kivotos replicate [NAME ...]        run the [[zfs.replicate]] entries now (what their timers do)
 
 Host settings:  /etc/kivotos/config.toml   (root-owned)
 Service rules:  <source>/<svc>/kivotos.toml (optional, must be owned by the source's user or root)
@@ -41,6 +42,7 @@ RULES = "kivotos.toml"
 UNITS = Path("/etc/systemd/system")
 HOOK_TIMEOUT = 15 * 60
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+DATASET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*(/[A-Za-z0-9_.:-]+)*$")
 
 errors: list[str] = []
 
@@ -101,6 +103,28 @@ def load_config() -> dict:
         die(f"{CONFIG}: missing 'user'")
     zfs = cfg.setdefault("zfs", {})
     zfs["dump_on"] = str_list(zfs.get("dump_on", ["daily"]), "zfs.dump_on")
+    names = set()
+    for r in zfs.setdefault("replicate", []):
+        if not isinstance(r, dict):
+            die(f"{CONFIG}: [[zfs.replicate]] entries must be tables")
+        if unknown := set(r) - {"name", "from", "to", "exclude", "schedule", "before"}:
+            die(f"{CONFIG}: [[zfs.replicate]] unknown keys {sorted(unknown)}")
+        for key in ("from", "to"):
+            if not isinstance(r.get(key), str) or not DATASET_RE.match(r[key]):
+                die(f"{CONFIG}: [[zfs.replicate]] needs '{key}' = a dataset name")
+        try:
+            r["exclude"] = str_list(r.get("exclude"), "exclude")
+            r["before"] = str_list(r.get("before"), "before")
+        except ValueError as e:
+            die(f"{CONFIG}: [[zfs.replicate]] {r['from']}: {e}")
+        for x in r["exclude"]:
+            if not DATASET_RE.match(x) or not (x == r["from"] or x.startswith(r["from"] + "/")):
+                die(f"{CONFIG}: [[zfs.replicate]] exclude {x!r} isn't a dataset under {r['from']}")
+        r.setdefault("name", r["from"].replace("/", "-"))
+        r.setdefault("schedule", "hourly")
+        if not NAME_RE.match(r["name"]) or r["name"] in names:
+            die(f"{CONFIG}: [[zfs.replicate]] name {r['name']!r} must be unique and match {NAME_RE.pattern}")
+        names.add(r["name"])
     if not cfg.get("source"):
         die(f"{CONFIG}: no [[source]] entries")
     for src in cfg["source"]:
@@ -480,28 +504,118 @@ def cmd_snapshot(cfg: dict, label: str | None) -> None:
     finish("snapshot")
 
 
-def sanoid_hooked(dataset: str) -> bool:
-    """Whether sanoid.conf has a section for `dataset` that calls kivotos hook before and after."""
+def sanoid_sections() -> dict[str, dict[str, str]]:
+    """sanoid.conf as {section: {key: value}}, or {} if it can't be read."""
     try:
         text = SANOID_CONF.read_text()
     except OSError:
-        return False
-    section, found = None, {}
+        return {}
+    sections, cur = {}, None
     for line in text.splitlines():
         line = line.split("#", 1)[0].strip()
         if line.startswith("[") and line.endswith("]"):
-            section = line[1:-1]
-        elif section == dataset and "=" in line:
+            cur = sections.setdefault(line[1:-1], {})
+        elif cur is not None and "=" in line:
             k, v = (x.strip() for x in line.split("=", 1))
-            found[k] = v
+            cur[k] = v
+    return sections
+
+
+def sanoid_policy(dataset: str, sections: dict) -> tuple[str, dict] | None:
+    """The sanoid section that applies to `dataset` (its own, or a recursive ancestor's) and its
+    settings with the template filled in. None if sanoid doesn't manage it."""
+    parts = dataset.split("/")
+    for i in range(len(parts), 0, -1):
+        name = "/".join(parts[:i])
+        sec = sections.get(name)
+        if sec is None or (name != dataset and sec.get("recursive", "no") == "no"):
+            continue
+        conf = {}
+        for t in sec.get("use_template", "").split(","):
+            conf.update(sections.get(f"template_{t.strip()}", {}))
+        conf.update(sec)
+        return name, conf
+    return None
+
+
+def describe_policy(dataset: str, sections: dict) -> str:
+    pol = sanoid_policy(dataset, sections)
+    if pol is None:
+        return "not in sanoid.conf: no snapshots, nothing pruned"
+    name, c = pol
+    keep = " ".join(f"{c[k]}{k[0]}" for k in ("frequently", "hourly", "daily", "weekly", "monthly", "yearly")
+                    if c.get(k, "0") not in ("0", ""))
+    take = "takes snapshots" if c.get("autosnap", "yes") == "yes" else "only prunes"
+    if c.get("autoprune", "yes") != "yes":
+        take += ", never prunes"
+    via = "" if name == dataset else f" (via [{name}])"
+    return f"{take}, keeps {keep or 'none'}{via}"
+
+
+def sanoid_hooked(dataset: str) -> bool:
+    """Whether sanoid.conf has a section for `dataset` that calls kivotos hook before and after."""
+    found = sanoid_sections().get(dataset, {})
     return all("kivotos hook" in found.get(k, "") for k in ("pre_snapshot_script", "post_snapshot_script"))
 
 
+# --- replication --------------------------------------------------------------------------------
+
+def config_is_root_only() -> bool:
+    """`before` commands run as root, so the config must be writable by root alone."""
+    st = CONFIG.stat()
+    return st.st_uid == 0 and not st.st_mode & 0o022
+
+
+def replicate(r: dict) -> None:
+    log(f"== replicate {r['name']}: {r['from']} -> {r['to']}")
+    for cmd in r["before"]:
+        log(f"   before: {cmd}")
+        if subprocess.run(["sh", "-c", cmd]).returncode != 0:
+            error(f"replicate {r['name']}: before command failed: {cmd}")
+    args = ["syncoid", "--recursive", "--no-sync-snap", "--create-bookmark", "--quiet"]
+    args += [f"--exclude-datasets=^{re.escape(x)}(/|$)" for x in r["exclude"]]
+    env = dict(os.environ, LC_ALL="C")   # perl's locale warnings otherwise
+    if subprocess.run([*args, r["from"], r["to"]], env=env).returncode != 0:
+        error(f"replicate {r['name']}: syncoid {r['from']} -> {r['to']} failed")
+
+
+def cmd_replicate(cfg: dict, only: list[str]) -> None:
+    if os.geteuid() != 0:
+        die("replicate needs root: sudo kivotos replicate")
+    if cfg["backend"] != "zfs":
+        die("replicate is for backend = \"zfs\"")
+    entries = [r for r in cfg["zfs"]["replicate"] if not only or r["name"] in only]
+    if missing := set(only) - {r["name"] for r in entries}:
+        die(f"no [[zfs.replicate]] named {', '.join(sorted(missing))}")
+    if any(r["before"] for r in entries) and not config_is_root_only():
+        die(f"{CONFIG} must be owned by root and writable only by root, because `before` runs as root")
+    for r in entries:
+        replicate(r)
+    finish("replicate")
+
+
 def plan_zfs(cfg: dict) -> None:
+    sections = sanoid_sections()
     log(f"backend zfs: sanoid snapshots, kivotos runs dumps (on {'/'.join(cfg['zfs']['dump_on'])} snapshots) and hooks")
+    if not sections:
+        log(f"  !! can't read {SANOID_CONF}")
+    for r in cfg["zfs"]["replicate"]:
+        log(f"\n[replicate {r['name']}] {r['from']} -> {r['to']}, {r['schedule']}"
+            + (f", except {', '.join(r['exclude'])}" if r["exclude"] else ""))
+        for cmd in r["before"]:
+            log(f"  before (as root): {cmd}")
+        log(f"  {r['from']}: {describe_policy(r['from'], sections)}")
+        log(f"  {r['to']}: {describe_policy(r['to'], sections)}")
+        pol = sanoid_policy(r["to"], sections)
+        if pol is None or pol[1].get("autoprune", "yes") != "yes":
+            log(f"  !! nothing prunes {r['to']}, so it keeps every snapshot it receives, forever")
+        elif pol[1].get("autosnap", "yes") == "yes":
+            log(f"  !! sanoid also takes its own snapshots of {r['to']}; set autosnap = no there")
+        if not (UNITS / f"kivotos-replicate-{r['name']}.timer").exists():
+            log(f"  !! no timer yet: sudo kivotos units")
     for src, _, root, ds, services in zfs_sources(cfg):
         hooked = sanoid_hooked(ds)
-        log(f"\n[{src['name']}] {root} on {ds}, hooks run as {src['user']}"
+        log(f"\n[{src['name']}] {root} on {ds}, hooks run as {src['user']}\n  {ds}: {describe_policy(ds, sections)}"
             + ("" if hooked else f"\n  !! {SANOID_CONF} doesn't call `kivotos hook` for [{ds}], so none of this runs"))
         if src.get("exclude"):
             log(f"  !! source exclude {src['exclude']} does nothing on zfs")
@@ -599,6 +713,35 @@ def cmd_plan(cfg: dict) -> None:
         sys.exit(1)
 
 
+def write_replicate_units(cfg: dict) -> None:
+    """One kivotos-replicate-<name>.service + .timer per [[zfs.replicate]]; stale ones are removed."""
+    head = f"# Written by `kivotos units` from {CONFIG}. Edit the config, not this file.\n"
+    exe = Path(sys.argv[0]).resolve()
+    want = set()
+    for r in cfg["zfs"]["replicate"]:
+        if subprocess.run(["systemd-analyze", "calendar", r["schedule"]], capture_output=True).returncode != 0:
+            die(f"[[zfs.replicate]] {r['name']}: schedule {r['schedule']!r} isn't a valid systemd OnCalendar expression")
+        unit = f"kivotos-replicate-{r['name']}"
+        want.add(unit)
+        (UNITS / f"{unit}.service").write_text(
+            head + f"[Unit]\nDescription=kivotos: replicate {r['from']} to {r['to']}\n"
+            "Requires=zfs.target\nAfter=zfs.target sanoid.service\n\n"
+            f"[Service]\nType=oneshot\nExecStart={exe} replicate {r['name']}\nNice=10\nIOSchedulingClass=idle\n")
+        (UNITS / f"{unit}.timer").write_text(
+            head + f"[Unit]\nDescription=kivotos: replicate {r['from']} to {r['to']}\n\n"
+            f"[Timer]\nOnCalendar={r['schedule']}\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n")
+    stale = {p.name.rsplit(".", 1)[0] for p in UNITS.glob("kivotos-replicate-*.timer")} - want
+    for unit in stale:
+        subprocess.run(["systemctl", "disable", "--now", f"{unit}.timer"], capture_output=True)
+        for ext in ("service", "timer"):
+            (UNITS / f"{unit}.{ext}").unlink(missing_ok=True)
+        log(f"Removed {unit} (no longer in the config)")
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    if want:
+        subprocess.run(["systemctl", "enable", "--now", *(f"{u}.timer" for u in sorted(want))], check=True)
+        subprocess.run(["systemctl", "list-timers", *(f"{u}.timer" for u in sorted(want)), "--no-pager"])
+
+
 def cmd_units(cfg: dict) -> None:
     if os.geteuid() != 0:
         die("units needs root: sudo kivotos units")
@@ -610,6 +753,7 @@ def cmd_units(cfg: dict) -> None:
                 u.unlink(missing_ok=True)
             subprocess.run(["systemctl", "daemon-reload"], check=True)
             log("Removed kivotos.service and kivotos.timer (backend is zfs, sanoid does the scheduling)")
+        write_replicate_units(cfg)
         for ds in sorted({ds for _, _, _, ds, _ in zfs_sources(cfg)}):
             if sanoid_hooked(ds):
                 log(f"sanoid calls kivotos for [{ds}]")
@@ -662,6 +806,8 @@ def main() -> None:
         cmd_units(cfg)
     elif cmd == "hook":
         cmd_hook(cfg)
+    elif cmd == "replicate":
+        cmd_replicate(cfg, rest)
     elif cmd == "snapshot":
         cmd_snapshot(cfg, rest[0] if rest else None)
     elif cmd == "restic":

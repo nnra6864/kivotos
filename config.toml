@@ -23,6 +23,14 @@ user = "your-user"
 [zfs]
 dump_on = ["daily"]
 
+# zfs backend: copy sanoid's snapshots to another pool (see README, "Replication"). As many as you like.
+# [[zfs.replicate]]
+# from     = "rpool"
+# to       = "backup/rpool"
+# exclude  = ["rpool/var/cache"]
+# schedule = "hourly"
+# before   = []            # shell commands run as root first
+
 # Kept per service (per backed-up path); everything older is pruned
 [retention]
 daily   = 7
